@@ -1,4 +1,3 @@
-
 /**
  * Advanced OMR Sheet Processor with Scanner-like Capabilities
  * 
