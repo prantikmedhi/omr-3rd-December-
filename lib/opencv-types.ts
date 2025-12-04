@@ -68,8 +68,10 @@ export interface OpenCV {
   CV_8UC1: number
   CV_8UC3: number
   CV_8UC4: number
+  CV_8U: number
   CV_32FC1: number
   CV_32FC2: number
+  CV_32F: number
   CV_32S: number
   
   // Threshold types
@@ -87,6 +89,11 @@ export interface OpenCV {
   MORPH_GRADIENT: number
   MORPH_TOPHAT: number
   MORPH_BLACKHAT: number
+  
+  // Bitwise operations
+  bitwise_and?(src1: OpenCVMat, src2: OpenCVMat, dst: OpenCVMat, mask?: OpenCVMat): void
+  bitwise_or?(src1: OpenCVMat, src2: OpenCVMat, dst: OpenCVMat, mask?: OpenCVMat): void
+  bitwise_not?(src: OpenCVMat, dst: OpenCVMat, mask?: OpenCVMat): void
   
   // Contour retrieval
   RETR_EXTERNAL: number
@@ -179,6 +186,23 @@ export interface OpenCV {
     delta?: number,
     borderType?: number
   ): void
+  
+  // Circle detection
+  HoughCircles?(
+    image: OpenCVMat,
+    circles: OpenCVMat,
+    method: number,
+    dp: number,
+    minDist: number,
+    param1?: number,
+    param2?: number,
+    minRadius?: number,
+    maxRadius?: number
+  ): void
+  
+  // HoughCircles constants
+  HOUGH_GRADIENT?: number
+  HOUGH_GRADIENT_ALT?: number
   
   // Contours
   findContours(
@@ -302,51 +326,8 @@ declare global {
   interface Window {
     cv: OpenCV
   }
-  const cv: OpenCV
-}
-
-import { useEffect, useState } from "react"
-import type { OpenCV } from "./opencv-types"
-
-declare global {
-  interface Window {
-    cv: OpenCV
-  }
-}
-
-export function useOpenCV() {
-  const [loaded, setLoaded] = useState(false)
-
-  useEffect(() => {
-    if (window.cv) {
-      setLoaded(true)
-      return
-    }
-
-    const script = document.createElement("script")
-    script.src = "/js/opencv.js"
-    script.async = true
-    script.onload = () => {
-      // OpenCV.js sometimes takes a moment to initialize even after load
-      if (window.cv && window.cv.getBuildInformation) {
-        setLoaded(true)
-      } else if (window.cv) {
-        // Wait for onRuntimeInitialized
-        window.cv.onRuntimeInitialized = () => {
-          setLoaded(true)
-        }
-      }
-    }
-    script.onerror = () => {
-      console.error("Failed to load OpenCV.js")
-    }
-    document.body.appendChild(script)
-
-    return () => {
-      // Cleanup not strictly necessary for single page app singleton script
-    }
-  }, [])
-
-  return loaded
+  // Declare cv as a global variable (available at runtime from OpenCV.js)
+  // eslint-disable-next-line no-var
+  var cv: OpenCV | undefined
 }
 
