@@ -72,8 +72,11 @@ function getCV(): OpenCV {
   if (typeof window !== 'undefined' && window.cv) {
     return window.cv
   }
-  if (typeof cv !== 'undefined') {
-    return cv as OpenCV
+  // Access global cv variable (declared in opencv-types.ts)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const globalCv = (globalThis as any).cv
+  if (globalCv) {
+    return globalCv as OpenCV
   }
   throw new Error("OpenCV.js is not loaded. Please wait for it to initialize.")
 }
@@ -306,8 +309,8 @@ function assessImageQuality(cv: OpenCV, src: OpenCVMat): ImageQualityMetrics {
   const stddev = new cv.Mat()
   cv.meanStdDev(gray, mean, stddev)
 
-  const brightness = mean.data64F[0]
-  const contrast = stddev.data64F[0] // Standard deviation as contrast measure
+  const brightness = mean.data64F?.[0] ?? 0
+  const contrast = stddev.data64F?.[0] ?? 0 // Standard deviation as contrast measure
 
   // Calculate sharpness using Sobel variance (approximation of Laplacian)
   const blurredForSharpness = new cv.Mat()
@@ -320,7 +323,7 @@ function assessImageQuality(cv: OpenCV, src: OpenCVMat): ImageQualityMetrics {
   const sobelMean = new cv.Mat()
   const sobelStddev = new cv.Mat()
   cv.meanStdDev(sobel, sobelMean, sobelStddev)
-  const sharpness = sobelStddev.data64F[0]
+  const sharpness = sobelStddev.data64F?.[0] ?? 0
   
   blurredForSharpness.delete()
 
@@ -368,7 +371,8 @@ function estimateNoiseLevel(cv: OpenCV, gray: OpenCVMat): number {
     const mean = new cv.Mat()
     const stddev = new cv.Mat()
     cv.meanStdDev(patchClone, mean, stddev)
-    totalVariance += stddev.data64F[0] * stddev.data64F[0]
+    const std = stddev.data64F?.[0] ?? 0
+    totalVariance += std * std
     
     patch.delete()
     patchClone.delete()
@@ -426,20 +430,12 @@ function applyAdvancedPreprocessing(
   const mean = new cv.Mat()
   const stddev = new cv.Mat()
   cv.meanStdDev(denoised, mean, stddev)
-  const avgBrightness = mean.data64F[0]
+  const avgBrightness = mean.data64F?.[0] ?? 0
   
   // Target brightness: 128
-  const brightnessAdjust = 128 - avgBrightness
-  const normalized = new cv.Mat()
-  
-  if (Math.abs(brightnessAdjust) > 10) {
-    // Apply brightness adjustment using convertTo
-    // Note: convertTo may not be available, so we'll use threshold-based approach
-    // For now, just use the denoised image
-    normalized = denoised.clone()
-  } else {
-    normalized = denoised.clone()
-  }
+  // Note: Brightness adjustment would require convertTo which may not be available in OpenCV.js
+  // For now, we use the denoised image directly
+  const normalized = denoised.clone()
   matsToCleanup.push(normalized, mean, stddev)
 
   // Convert back to RGBA for further processing
@@ -523,8 +519,8 @@ function detectPaperAtScale(
   const mean = new cv.Mat()
   const stddev = new cv.Mat()
   cv.meanStdDev(blurred, mean, stddev)
-  const avgIntensity = mean.data64F[0]
-  const intensityStd = stddev.data64F[0]
+  const avgIntensity = mean.data64F?.[0] ?? 0
+  const intensityStd = stddev.data64F?.[0] ?? 0
   
   // Adaptive thresholds: lower for darker images, higher for brighter
   const lowerThreshold = Math.max(30, Math.min(100, avgIntensity * 0.5))
@@ -539,14 +535,16 @@ function detectPaperAtScale(
 
   // Dilate edges to connect broken lines using morphology
   const dilated = new cv.Mat()
-  const kernel = cv.Mat.ones(3, 3, cv.CV_8U)
+  const kernel = cv.Mat.ones(3, 3, cv.CV_8UC1)
   cv.morphologyEx(edge, dilated, cv.MORPH_DILATE, kernel, new cv.Point(-1, -1), 2)
   matsToCleanup.push(dilated, kernel)
 
   const contours = new cv.MatVector()
   const hierarchy = new cv.Mat()
   cv.findContours(dilated, contours, hierarchy, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE)
-  matsToCleanup.push(contours, hierarchy)
+  matsToCleanup.push(hierarchy)
+  // Note: contours is OpenCVMatVector, not OpenCVMat, so we'll clean it up separately
+  matsToCleanup.push(contours as unknown as OpenCVMat)
 
   let maxArea = 0
   let biggestApprox: OpenCVMat | null = null
@@ -602,6 +600,9 @@ function detectPaperAtScale(
 function orderPoints(approx: OpenCVMat): { x: number; y: number }[] {
   const points: { x: number; y: number }[] = []
   const data = approx.data32S
+  if (!data) {
+    throw new Error("Invalid approximation data")
+  }
 
   for (let i = 0; i < 4; i++) {
     points.push({ x: data[i * 2], y: data[i * 2 + 1] })
@@ -712,7 +713,7 @@ function detectBubblesAdvanced(
   matsToCleanup.push(thresh)
 
   // Morphological operations to clean up
-  const kernel = cv.Mat.ones(3, 3, cv.CV_8U)
+  const kernel = cv.Mat.ones(3, 3, cv.CV_8UC1)
   cv.morphologyEx(thresh, thresh, cv.MORPH_CLOSE, kernel, new cv.Point(-1, -1), 2)
   cv.morphologyEx(thresh, thresh, cv.MORPH_OPEN, kernel, new cv.Point(-1, -1), 1)
   matsToCleanup.push(kernel)
@@ -721,7 +722,9 @@ function detectBubblesAdvanced(
   const contours = new cv.MatVector()
   const hierarchy = new cv.Mat()
   cv.findContours(thresh, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-  matsToCleanup.push(contours, hierarchy)
+  matsToCleanup.push(hierarchy)
+  // Note: contours is OpenCVMatVector, not OpenCVMat, so we'll clean it up separately
+  matsToCleanup.push(contours as unknown as OpenCVMat)
 
   // Filter contours to find bubbles
   const bubbles: Bubble[] = []
@@ -891,7 +894,7 @@ function calculateFillPercentageAdvanced(
   matsToCleanup.push(roi)
 
   const roiThresh = new cv.Mat()
-  const mask = new cv.Mat.zeros(roi.rows, roi.cols, cv.CV_8UC1)
+  const mask = cv.Mat.zeros(roi.rows, roi.cols, cv.CV_8UC1)
   matsToCleanup.push(roiThresh, mask)
 
   try {
@@ -899,7 +902,7 @@ function calculateFillPercentageAdvanced(
     const mean = new cv.Mat()
     const stddev = new cv.Mat()
     cv.meanStdDev(roi, mean, stddev)
-    const std = stddev.data64F[0]
+    const std = stddev.data64F?.[0] ?? 0
     mean.delete()
     stddev.delete()
 
