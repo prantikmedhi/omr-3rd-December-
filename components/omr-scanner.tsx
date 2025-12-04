@@ -35,6 +35,7 @@ const randomProfiles = [...profiles].sort(() => Math.random() - 0.5);
   const [omrSheet, setOmrSheet] = useState<File | null>(null)
   const [answerKey, setAnswerKey] = useState<File | null>(null)
   const [choicesPerQuestion, setChoicesPerQuestion] = useState(4)
+  const [autoDetectChoices, setAutoDetectChoices] = useState(true)
   const [minFillThreshold, setMinFillThreshold] = useState(0.25)
   const [binaryThreshold, setBinaryThreshold] = useState(128)
   const [showThresholdedImage, setShowThresholdedImage] = useState(false)
@@ -153,11 +154,11 @@ const randomProfiles = [...profiles].sort(() => Math.random() - 0.5);
         throw new Error("Could not parse any answers from the answer key file.")
       }
 
-      // Process OMR sheet
+      // Process OMR sheet (use 0 for auto-detection if enabled)
       const processResult = await processOMRSheet(
         omrSheet,
         answers,
-        choicesPerQuestion,
+        autoDetectChoices ? 0 : choicesPerQuestion,
         minFillThreshold,
         binaryThreshold
       )
@@ -172,7 +173,7 @@ const randomProfiles = [...profiles].sort(() => Math.random() - 0.5);
     } finally {
       setProcessing(false)
     }
-  }, [omrSheet, answerKey, choicesPerQuestion, minFillThreshold, binaryThreshold, opencvLoaded])
+  }, [omrSheet, answerKey, choicesPerQuestion, autoDetectChoices, minFillThreshold, binaryThreshold, opencvLoaded])
 
   const getStatusIcon = (status: string) => {
     switch (status) {
@@ -284,22 +285,38 @@ const randomProfiles = [...profiles].sort(() => Math.random() - 0.5);
               <div className="space-y-2">
                 <div className="flex items-center justify-between">
                    <Label>Choices per Question</Label>
-                   <Input
-                      type="number"
-                      value={choicesPerQuestion}
-                      onChange={(e) => setChoicesPerQuestion(Number(e.target.value))}
-                      className="w-20 h-8"
-                      min={2}
-                      max={10}
-                   />
+                   <div className="flex items-center gap-2">
+                     <Switch
+                       id="auto-detect-choices"
+                       checked={autoDetectChoices}
+                       onCheckedChange={setAutoDetectChoices}
+                     />
+                     <Label htmlFor="auto-detect-choices" className="text-xs font-normal">Auto-detect</Label>
+                     <Input
+                        type="number"
+                        value={choicesPerQuestion}
+                        onChange={(e) => setChoicesPerQuestion(Number(e.target.value))}
+                        className="w-20 h-8"
+                        min={2}
+                        max={10}
+                        disabled={autoDetectChoices}
+                     />
+                   </div>
                 </div>
-                <Slider
-                  value={[choicesPerQuestion]}
-                  onValueChange={(v) => setChoicesPerQuestion(v[0])}
-                  min={2}
-                  max={10}
-                  step={1}
-                />
+                {!autoDetectChoices && (
+                  <Slider
+                    value={[choicesPerQuestion]}
+                    onValueChange={(v) => setChoicesPerQuestion(v[0])}
+                    min={2}
+                    max={10}
+                    step={1}
+                  />
+                )}
+                <p className="text-xs text-muted-foreground">
+                  {autoDetectChoices 
+                    ? "Automatically detects the number of choices per question from the image"
+                    : "Manually set the number of answer choices per question"}
+                </p>
               </div>
 
               <div className="space-y-2">
@@ -417,7 +434,7 @@ const randomProfiles = [...profiles].sort(() => Math.random() - 0.5);
                 </div>
 
                 {/* Stats */}
-                <div className="flex gap-4 text-sm">
+                <div className="flex gap-4 text-sm flex-wrap">
                   <div className="flex items-center gap-1">
                     <CheckCircle className="h-4 w-4 text-green-500" />
                     <span>Correct: {result.score}</span>
@@ -434,6 +451,11 @@ const randomProfiles = [...profiles].sort(() => Math.random() - 0.5);
                     <AlertCircle className="h-4 w-4 text-yellow-500" />
                     <span>Multiple: {result.multipleAnswers}</span>
                   </div>
+                  {result.detectedChoicesPerQuestion && (
+                    <div className="flex items-center gap-1 text-muted-foreground">
+                      <span>Detected: {result.detectedChoicesPerQuestion} choices/question</span>
+                    </div>
+                  )}
                 </div>
 
                 {/* Processed Image */}
