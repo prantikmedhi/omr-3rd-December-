@@ -228,12 +228,22 @@ function processImageOpenCV(
       const questionNum = q + 1
       const correctAns = answerKey[questionNum]
 
+      // Handle incomplete rows (missing bubbles)
+      // Pad with zeros if we have fewer bubbles than expected
       const fillPercentages = row.bubbles.map(bubble => 
         calculateFillPercentageAdvanced(cv, gray, bubble, matsToCleanup)
       )
+      
+      // If we have fewer bubbles than expected, pad with zeros (unfilled)
+      while (fillPercentages.length < config.choicesPerQuestion) {
+        fillPercentages.push(0)
+      }
+      
+      // Only use the first N bubbles (in case we have more than expected)
+      const trimmedFillPercentages = fillPercentages.slice(0, config.choicesPerQuestion)
 
       const { selectedIdx, isValid, hasMultiple } = detectSelectedBubble(
-        fillPercentages,
+        trimmedFillPercentages,
         config.minFillThreshold
       )
 
@@ -259,10 +269,13 @@ function processImageOpenCV(
         status,
         selected: isValid ? selectedIdx : null,
         correctAnswer: correctAns ?? null,
-        fillPercentages,
+        fillPercentages: trimmedFillPercentages,
       })
 
-      drawResultMarkersOpenCV(cv, src, row.bubbles, fillPercentages, config.minFillThreshold, correctAns, status, isValid, hasMultiple)
+      // Only draw markers for bubbles that actually exist
+      const bubblesToDraw = row.bubbles.slice(0, config.choicesPerQuestion)
+      const fillToDraw = trimmedFillPercentages
+      drawResultMarkersOpenCV(cv, src, bubblesToDraw, fillToDraw, config.minFillThreshold, correctAns, status, isValid, hasMultiple)
     }
 
     // Step 7: Generate output image
@@ -676,7 +689,8 @@ function performPerspectiveTransform(
 }
 
 /**
- * Advanced bubble detection with adaptive parameters
+ * Ultra-robust bubble detection using multi-pass approach
+ * Tries multiple methods and combines results for maximum detection rate
  */
 function detectBubblesAdvanced(
   cv: OpenCV,
@@ -689,50 +703,225 @@ function detectBubblesAdvanced(
   cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0)
   matsToCleanup.push(gray)
 
-  // Adaptive blur based on image quality
-  const blurSize = quality.overall === 'poor' ? 7 : quality.overall === 'fair' ? 5 : 3
-  const ksize = new cv.Size(blurSize, blurSize)
-  const blurred = new cv.Mat()
-  cv.GaussianBlur(gray, blurred, ksize, 0, 0, cv.BORDER_DEFAULT)
-  matsToCleanup.push(blurred)
+  // Enhanced preprocessing: Median blur to reduce noise while preserving edges
+  const denoised = new cv.Mat()
+  cv.medianBlur(gray, denoised, 5)
+  matsToCleanup.push(denoised)
 
-  // Adaptive thresholding parameters based on image quality
-  const blockSize = quality.overall === 'poor' ? 25 : quality.overall === 'fair' ? 21 : 15
-  const C = quality.overall === 'poor' ? 8 : quality.overall === 'fair' ? 5 : 3
+  // Edge-preserving smoothing
+  const smoothed = new cv.Mat()
+  const blurSize = quality.overall === 'poor' ? 5 : 3
+  const ksize = new cv.Size(blurSize * 2 + 1, blurSize * 2 + 1)
+  cv.GaussianBlur(denoised, smoothed, ksize, 1.0, 1.0, cv.BORDER_DEFAULT)
+  matsToCleanup.push(smoothed)
 
-  const thresh = new cv.Mat()
+  // Calculate adaptive thresholds based on image statistics
+  const mean = new cv.Mat()
+  const stddev = new cv.Mat()
+  cv.meanStdDev(smoothed, mean, stddev)
+  const avgIntensity = mean.data64F?.[0] ?? 128
+  mean.delete()
+  stddev.delete()
+
+  // Method 1: Otsu thresholding (best for uniform lighting)
+  const threshOtsu = new cv.Mat()
+  cv.threshold(smoothed, threshOtsu, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU)
+  matsToCleanup.push(threshOtsu)
+
+  // Method 2: Adaptive thresholding (best for varying lighting)
+  const threshAdaptive = new cv.Mat()
+  const blockSize = quality.overall === 'poor' ? 21 : quality.overall === 'fair' ? 17 : 13
+  const C = quality.overall === 'poor' ? 7 : quality.overall === 'fair' ? 4 : 2
   cv.adaptiveThreshold(
-    blurred,
-    thresh,
+    smoothed,
+    threshAdaptive,
     255,
     cv.ADAPTIVE_THRESH_GAUSSIAN_C,
     cv.THRESH_BINARY_INV,
     blockSize,
     C
   )
-  matsToCleanup.push(thresh)
+  matsToCleanup.push(threshAdaptive)
 
-  // Morphological operations to clean up
+  // Method 3: Canny edge detection for edge-based detection
+  const edges = new cv.Mat()
+  const lowerThreshold = Math.max(30, avgIntensity * 0.4)
+  const upperThreshold = Math.max(100, avgIntensity * 1.2)
+  cv.Canny(smoothed, edges, lowerThreshold, upperThreshold, 3, false)
+  matsToCleanup.push(edges)
+
+  // Combine methods: Use Otsu as primary, but also check adaptive
+  const combined = threshOtsu.clone()
+  matsToCleanup.push(combined)
+
+  // Morphological operations to clean up and connect broken edges
   const kernel = cv.Mat.ones(3, 3, cv.CV_8UC1)
-  cv.morphologyEx(thresh, thresh, cv.MORPH_CLOSE, kernel, new cv.Point(-1, -1), 2)
-  cv.morphologyEx(thresh, thresh, cv.MORPH_OPEN, kernel, new cv.Point(-1, -1), 1)
+  cv.morphologyEx(combined, combined, cv.MORPH_CLOSE, kernel, new cv.Point(-1, -1), 2)
+  cv.morphologyEx(combined, combined, cv.MORPH_OPEN, kernel, new cv.Point(-1, -1), 1)
   matsToCleanup.push(kernel)
 
-  // Find contours
-  const contours = new cv.MatVector()
-  const hierarchy = new cv.Mat()
-  cv.findContours(thresh, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-  matsToCleanup.push(hierarchy)
-  // Note: contours is OpenCVMatVector, not OpenCVMat, so we'll clean it up separately
-  matsToCleanup.push(contours as unknown as OpenCVMat)
+  // Try HoughCircles first (most accurate for perfect circles)
+  const bubblesFromHough: Bubble[] = []
+  if (cv.HoughCircles && cv.HOUGH_GRADIENT !== undefined) {
+    try {
+      const circles = new cv.Mat()
+      const totalPixels = src.cols * src.rows
+      const minRadius = Math.max(3, Math.floor(Math.sqrt(totalPixels * 0.00005 / Math.PI)))
+      const maxRadius = Math.min(
+        Math.min(src.cols, src.rows) / 3,
+        Math.floor(Math.sqrt(totalPixels * 0.015 / Math.PI))
+      )
+      const minDist = minRadius * 1.5 // Reduced for better detection
 
-  // Filter contours to find bubbles
-  const bubbles: Bubble[] = []
+      cv.HoughCircles(
+        smoothed,
+        circles,
+        cv.HOUGH_GRADIENT!,
+        1, // dp
+        minDist,
+        avgIntensity * 1.2, // param1 - Canny threshold
+        avgIntensity * 0.6, // param2 - accumulator threshold (lower = more circles)
+        minRadius,
+        maxRadius
+      )
+
+      if (circles.cols > 0) {
+        const circlesData = circles.data32F
+        if (circlesData) {
+          for (let i = 0; i < circles.cols; i++) {
+            const x = circlesData[i * 3]
+            const y = circlesData[i * 3 + 1]
+            const radius = circlesData[i * 3 + 2]
+
+            if (x > 0 && y > 0 && radius > 0 && x < src.cols && y < src.rows) {
+              bubblesFromHough.push({
+                x: Math.round(x - radius),
+                y: Math.round(y - radius),
+                width: Math.round(radius * 2),
+                height: Math.round(radius * 2),
+                centerX: Math.round(x),
+                centerY: Math.round(y),
+                area: Math.PI * radius * radius,
+                circularity: 1.0,
+              })
+            }
+          }
+        }
+      }
+      circles.delete()
+    } catch (e) {
+      console.warn("HoughCircles failed:", e)
+    }
+  }
+
+  // Multi-pass contour detection with different parameters
+  const allBubblesFromContours: Bubble[] = []
   const totalPixels = src.cols * src.rows
 
-  // Adaptive area thresholds based on image size
-  const minArea = totalPixels * 0.00003 // More lenient minimum
-  const maxArea = totalPixels * 0.01    // More lenient maximum
+  // Pass 1: RETR_EXTERNAL (external contours only)
+  const bubbles1 = detectBubblesFromContours(cv, combined, totalPixels, cv.RETR_EXTERNAL, matsToCleanup)
+  allBubblesFromContours.push(...bubbles1)
+
+  // Pass 2: RETR_TREE (all contours including nested) - catches bubbles inside filled bubbles
+  const bubbles2 = detectBubblesFromContours(cv, combined, totalPixels, cv.RETR_TREE, matsToCleanup)
+  allBubblesFromContours.push(...bubbles2)
+
+  // Pass 3: Try with adaptive threshold as well
+  const combinedAdaptive = threshAdaptive.clone()
+  cv.morphologyEx(combinedAdaptive, combinedAdaptive, cv.MORPH_CLOSE, kernel, new cv.Point(-1, -1), 2)
+  cv.morphologyEx(combinedAdaptive, combinedAdaptive, cv.MORPH_OPEN, kernel, new cv.Point(-1, -1), 1)
+  matsToCleanup.push(combinedAdaptive)
+  const bubbles3 = detectBubblesFromContours(cv, combinedAdaptive, totalPixels, cv.RETR_EXTERNAL, matsToCleanup)
+  allBubblesFromContours.push(...bubbles3)
+
+  // Remove duplicates from contour detection
+  const uniqueContourBubbles = removeDuplicateBubbles(allBubblesFromContours)
+
+  // Combine HoughCircles and Contours
+  let allBubbles: Bubble[] = []
+
+  if (bubblesFromHough.length > 0) {
+    allBubbles = [...bubblesFromHough]
+
+    // Add non-overlapping contours
+    for (const contourBubble of uniqueContourBubbles) {
+      const overlaps = allBubbles.some(houghBubble => {
+        const dist = Math.hypot(
+          contourBubble.centerX - houghBubble.centerX,
+          contourBubble.centerY - houghBubble.centerY
+        )
+        const avgRadius = (contourBubble.width + houghBubble.width) / 4
+        return dist < avgRadius * 1.2 // Overlap threshold
+      })
+
+      if (!overlaps) {
+        allBubbles.push(contourBubble)
+      }
+    }
+  } else {
+    allBubbles = uniqueContourBubbles
+  }
+
+  // Advanced statistical filtering
+  if (allBubbles.length > 0) {
+    // Remove duplicates again after combining
+    allBubbles = removeDuplicateBubbles(allBubbles)
+
+    // Filter by area using IQR method
+    allBubbles.sort((a, b) => a.area - b.area)
+    const q1Index = Math.floor(allBubbles.length * 0.25)
+    const q3Index = Math.floor(allBubbles.length * 0.75)
+    const q1 = allBubbles[q1Index].area
+    const q3 = allBubbles[q3Index].area
+    const iqr = q3 - q1
+    const minValidArea = Math.max(q1 - 2 * iqr, totalPixels * 0.00001) // Very lenient
+    const maxValidArea = Math.min(q3 + 2 * iqr, totalPixels * 0.02) // Very lenient
+
+    // Filter by size consistency
+    const areas = allBubbles.map(b => b.area)
+    const medianArea = areas[Math.floor(areas.length / 2)]
+    const meanArea = areas.reduce((a, b) => a + b, 0) / areas.length
+    const stdArea = Math.sqrt(
+      areas.reduce((sum, a) => sum + Math.pow(a - meanArea, 2), 0) / areas.length
+    )
+
+    return allBubbles.filter(b => {
+      // IQR filter (very lenient)
+      if (b.area < minValidArea || b.area > maxValidArea) return false
+
+      // Statistical filter (within 4 standard deviations - very lenient)
+      if (Math.abs(b.area - meanArea) > 4 * stdArea) return false
+
+      // Size consistency (within 3x of median - very lenient)
+      if (b.area < medianArea * 0.15 || b.area > medianArea * 3.5) return false
+
+      return true
+    })
+  }
+
+  return allBubbles
+}
+
+/**
+ * Detect bubbles from contours with lenient parameters
+ */
+function detectBubblesFromContours(
+  cv: OpenCV,
+  binary: OpenCVMat,
+  totalPixels: number,
+  retrievalMode: number,
+  matsToCleanup: OpenCVMat[]
+): Bubble[] {
+  const bubbles: Bubble[] = []
+  const contours = new cv.MatVector()
+  const hierarchy = new cv.Mat()
+  cv.findContours(binary, contours, hierarchy, retrievalMode, cv.CHAIN_APPROX_SIMPLE)
+  matsToCleanup.push(hierarchy)
+  matsToCleanup.push(contours as unknown as OpenCVMat)
+
+  // Very lenient area thresholds
+  const minArea = totalPixels * 0.00001 // Very lenient
+  const maxArea = totalPixels * 0.02    // Very lenient
 
   for (let i = 0; i < contours.size(); ++i) {
     const contour = contours.get(i)
@@ -748,9 +937,14 @@ function detectBubblesAdvanced(
       const circularity = (4 * Math.PI * area) / (perimeter * perimeter)
       const rect = cv.boundingRect(contour)
       const aspectRatio = rect.width / rect.height
+      const extent = area / (rect.width * rect.height)
 
-      // More lenient circularity check
-      if (aspectRatio >= 0.5 && aspectRatio <= 2.0 && circularity > 0.3) {
+      // Very lenient filtering - accept almost any circular-like shape
+      if (
+        aspectRatio >= 0.3 && aspectRatio <= 3.0 && // Very lenient aspect ratio
+        circularity > 0.2 && // Very lenient circularity
+        extent > 0.3 // At least 30% of bounding box filled
+      ) {
         const centerX = rect.x + rect.width / 2
         const centerY = rect.y + rect.height / 2
 
@@ -769,28 +963,46 @@ function detectBubblesAdvanced(
     contour.delete()
   }
 
-  // Filter by median area to remove outliers
-  if (bubbles.length > 0) {
-    bubbles.sort((a, b) => a.area - b.area)
-    const medianArea = bubbles[Math.floor(bubbles.length / 2)].area
-    const minValidArea = medianArea * 0.3
-    const maxValidArea = medianArea * 2.5
-
-    return bubbles.filter(b => b.area >= minValidArea && b.area <= maxValidArea)
-  }
-
   return bubbles
 }
 
 /**
- * Group bubbles into rows (questions)
+ * Remove duplicate bubbles (same center within threshold)
+ */
+function removeDuplicateBubbles(bubbles: Bubble[]): Bubble[] {
+  const unique: Bubble[] = []
+  const threshold = 5 // pixels
+
+  for (const bubble of bubbles) {
+    const isDuplicate = unique.some(existing => {
+      const dist = Math.hypot(
+        bubble.centerX - existing.centerX,
+        bubble.centerY - existing.centerY
+      )
+      return dist < threshold
+    })
+
+    if (!isDuplicate) {
+      unique.push(bubble)
+    }
+  }
+
+  return unique
+}
+
+/**
+ * Enhanced grouping algorithm that handles missing bubbles and incomplete rows
  */
 function groupBubblesIntoRows(bubbles: Bubble[], choicesPerQuestion: number): BubbleRow[] {
+  if (bubbles.length === 0) return []
+
   bubbles.sort((a, b) => a.centerY - b.centerY)
 
+  // Calculate row spacing more accurately
   const avgHeight = bubbles.reduce((acc, b) => acc + b.height, 0) / bubbles.length
-  const rowTolerance = avgHeight * 0.7 // Increased tolerance
+  const rowTolerance = avgHeight * 1.0 // Increased tolerance for better grouping
 
+  // Group bubbles into rows
   const rows: BubbleRow[] = []
   let currentRow: Bubble[] = []
 
@@ -819,49 +1031,152 @@ function groupBubblesIntoRows(bubbles: Bubble[], choicesPerQuestion: number): Bu
     })
   }
 
-  // Filter and organize rows
+  // Enhanced row processing: handle incomplete rows and multiple columns
   const validRows: BubbleRow[] = []
+
+  // First, identify column structure
+  const allBubblesFlat = rows.flatMap(r => r.bubbles)
+  allBubblesFlat.sort((a, b) => a.centerX - b.centerX)
+
+  // Detect columns by finding X-coordinate clusters
+  const columns: number[] = []
+  let lastColumnX = -1
+  const avgBubbleWidth = allBubblesFlat.reduce((sum, b) => sum + b.width, 0) / allBubblesFlat.length
+
+  for (const bubble of allBubblesFlat) {
+    if (lastColumnX === -1 || bubble.centerX - lastColumnX > avgBubbleWidth * 2.5) {
+      columns.push(bubble.centerX)
+      lastColumnX = bubble.centerX
+    }
+  }
+
+  // Process each row
   for (const row of rows) {
-    if (row.bubbles.length >= choicesPerQuestion) {
+    // Sort bubbles in row by X coordinate
+    row.bubbles.sort((a, b) => a.centerX - b.centerX)
+
+    // Group bubbles by column
+    const bubblesByColumn: Bubble[][] = []
+    for (let i = 0; i < columns.length; i++) {
+      bubblesByColumn[i] = []
+    }
+
+    for (const bubble of row.bubbles) {
+      // Find closest column
+      let closestCol = 0
+      let minDist = Math.abs(bubble.centerX - columns[0])
+      for (let i = 1; i < columns.length; i++) {
+        const dist = Math.abs(bubble.centerX - columns[i])
+        if (dist < minDist) {
+          minDist = dist
+          closestCol = i
+        }
+      }
+
+      if (minDist < avgBubbleWidth * 2) {
+        bubblesByColumn[closestCol].push(bubble)
+      }
+    }
+
+    // Process each column's bubbles
+    for (const columnBubbles of bubblesByColumn) {
+      if (columnBubbles.length === 0) continue
+
+      // Sort by X within column
+      columnBubbles.sort((a, b) => a.centerX - b.centerX)
+
+      // Group into question sets
       let i = 0
-      while (i + choicesPerQuestion <= row.bubbles.length) {
-        const chunk = row.bubbles.slice(i, i + choicesPerQuestion)
-        validRows.push({
-          bubbles: chunk,
-          avgY: row.avgY,
-        })
-        i += choicesPerQuestion
+      while (i < columnBubbles.length) {
+        const questionBubbles: Bubble[] = []
+        const startX = columnBubbles[i].centerX
+        const avgBubbleSize = columnBubbles.reduce((sum, b) => sum + b.width, 0) / columnBubbles.length
+
+        // Collect bubbles that belong to the same question (close X coordinates)
+        while (i < columnBubbles.length) {
+          const bubble = columnBubbles[i]
+          const distFromStart = Math.abs(bubble.centerX - startX)
+
+          if (questionBubbles.length === 0 || distFromStart < avgBubbleSize * 1.5) {
+            questionBubbles.push(bubble)
+            i++
+          } else {
+            break
+          }
+        }
+
+        // If we have at least some bubbles (even if not complete), create a row
+        if (questionBubbles.length > 0) {
+          // Sort by X to ensure proper order
+          questionBubbles.sort((a, b) => a.centerX - b.centerX)
+
+          // If we have fewer bubbles than expected, still accept it (missing bubbles)
+          // But try to fill gaps if possible
+          if (questionBubbles.length < choicesPerQuestion) {
+            // Check if we can infer missing bubbles from spacing
+            const spacing = questionBubbles.length > 1
+              ? (questionBubbles[questionBubbles.length - 1].centerX - questionBubbles[0].centerX) / (questionBubbles.length - 1)
+              : avgBubbleSize * 1.5
+
+            // For now, just accept incomplete rows - they'll be handled in scoring
+            validRows.push({
+              bubbles: questionBubbles,
+              avgY: row.avgY,
+            })
+          } else {
+            // Split into complete question sets
+            let j = 0
+            while (j + choicesPerQuestion <= questionBubbles.length) {
+              const chunk = questionBubbles.slice(j, j + choicesPerQuestion)
+              validRows.push({
+                bubbles: chunk,
+                avgY: row.avgY,
+              })
+              j += choicesPerQuestion
+            }
+
+            // Handle remaining bubbles (incomplete set)
+            if (j < questionBubbles.length) {
+              validRows.push({
+                bubbles: questionBubbles.slice(j),
+                avgY: row.avgY,
+              })
+            }
+          }
+        }
       }
     }
   }
 
   if (validRows.length === 0) return []
 
-  // Handle multiple columns
+  // Final organization: sort by column, then by row
   const sortedByX = [...validRows].sort((a, b) => a.bubbles[0].centerX - b.bubbles[0].centerX)
-  const columns: BubbleRow[][] = []
+  const organizedColumns: BubbleRow[][] = []
   let currentCol: BubbleRow[] = [sortedByX[0]]
-  columns.push(currentCol)
+  organizedColumns.push(currentCol)
 
-  let lastX = sortedByX[0].bubbles[0].centerX
+  let lastColX = sortedByX[0].bubbles[0].centerX
   const bubbleWidth = sortedByX[0].bubbles[0].width
 
   for (let k = 1; k < sortedByX.length; k++) {
     const row = sortedByX[k]
     const currX = row.bubbles[0].centerX
 
-    if (currX - lastX > bubbleWidth * 3) {
+    // More lenient column separation
+    if (currX - lastColX > bubbleWidth * 2.5) {
       currentCol = [row]
-      columns.push(currentCol)
-      lastX = currX
+      organizedColumns.push(currentCol)
+      lastColX = currX
     } else {
       currentCol.push(row)
     }
   }
 
-  columns.forEach(col => col.sort((a, b) => a.avgY - b.avgY))
+  // Sort each column by Y coordinate
+  organizedColumns.forEach(col => col.sort((a, b) => a.avgY - b.avgY))
 
-  return columns.flat()
+  return organizedColumns.flat()
 }
 
 /**
@@ -907,12 +1222,29 @@ function calculateFillPercentageAdvanced(
     stddev.delete()
 
     // Flat areas (empty bubbles) have low variance
-    if (std < 8) {
+    // Reduced threshold to catch more bubbles with faint marks
+    if (std < 5) {
       return 0
     }
 
-    // Otsu's thresholding
-    cv.threshold(roi, roiThresh, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU)
+    // Try adaptive thresholding first for better accuracy on varying lighting
+    const adaptiveBlockSize = Math.max(3, Math.min(roi.cols, roi.rows) / 3)
+    const blockSize = adaptiveBlockSize % 2 === 1 ? adaptiveBlockSize : adaptiveBlockSize + 1
+    
+    try {
+      cv.adaptiveThreshold(
+        roi,
+        roiThresh,
+        255,
+        cv.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv.THRESH_BINARY_INV,
+        blockSize,
+        2
+      )
+    } catch (e) {
+      // Fallback to Otsu if adaptive fails
+      cv.threshold(roi, roiThresh, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU)
+    }
 
     // Create circular mask
     const center = new cv.Point(Math.floor(roi.cols / 2), Math.floor(roi.rows / 2))
@@ -949,12 +1281,36 @@ function calculateFillPercentageAdvanced(
     const meanPaper = paperSum / paperCount
     const contrast = meanPaper - meanInk
 
-    // Enhanced contrast check
-    if (contrast < 15) {
+    // Enhanced contrast check - reduced threshold for better detection of faint marks
+    if (contrast < 8) {
       return 0
     }
 
-    return inkCount / (inkCount + paperCount)
+    const fillRatio = inkCount / (inkCount + paperCount)
+    
+    // Additional validation: check intensity distribution
+    // Filled bubbles should have a clear bimodal distribution (dark ink vs light paper)
+    const intensityValues: number[] = []
+    for (let i = 0; i < roiData.length; i++) {
+      if (maskData[i] === 255) {
+        intensityValues.push(roiData[i])
+      }
+    }
+    
+    if (intensityValues.length > 0) {
+      intensityValues.sort((a, b) => a - b)
+      const q25 = intensityValues[Math.floor(intensityValues.length * 0.25)]
+      const q75 = intensityValues[Math.floor(intensityValues.length * 0.75)]
+      const iqr = q75 - q25
+      
+      // If there's a clear separation (high IQR), it's likely a filled bubble
+      // If IQR is very low, it's likely uniform (empty bubble)
+      if (iqr < 10 && fillRatio < 0.3) {
+        return 0 // Uniform and low fill = empty
+      }
+    }
+    
+    return fillRatio
 
   } catch (e) {
     console.error("Fill calculation error:", e)
