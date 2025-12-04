@@ -195,7 +195,7 @@ const randomProfiles = [...profiles].sort(() => Math.random() - 0.5);
         <ModeToggle />
       </div>
       <div className="mb-8 text-center">
-        <h1 className="text-4xl font-bold text-foreground mb-2">OMR Sheet Scanner</h1>
+        <h1 className="text-4xl font-bold text-foreground mb-2">OMR Sheet Scanner1</h1>
         <p className="text-muted-foreground">
             {!opencvLoaded ? (
                 <span className="flex items-center justify-center gap-2">
