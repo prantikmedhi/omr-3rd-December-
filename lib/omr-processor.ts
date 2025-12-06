@@ -635,16 +635,11 @@ function detectPaperAtScale(
         points = orderPoints(biggestApprox)
       }
 
-      const warpedMat = performPerspectiveTransform(cv, src, points)
+      let warpedMat = performPerspectiveTransform(cv, src, points)
       biggestApprox.delete()
       
-      // Auto-rotate if landscape
-      if (warpedMat.cols > warpedMat.rows) {
-        const rotated = new cv.Mat()
-        cv.rotate(warpedMat, rotated, cv.ROTATE_90_CLOCKWISE)
-        warpedMat.delete()
-        return { found: true, warpedMat: rotated }
-      }
+      // Auto-correct orientation (handles 90/180/270 degree rotation)
+      warpedMat = autoCorrectOrientation(cv, warpedMat, matsToCleanup)
 
       return { found: true, warpedMat }
     } catch (e) {
@@ -654,6 +649,88 @@ function detectPaperAtScale(
   }
 
   return { found: false, warpedMat: null }
+}
+
+/**
+ * Automatically correct orientation based on content density (text/logos usually at top)
+ */
+function autoCorrectOrientation(
+  cv: OpenCVInstance,
+  src: OpenCVMat,
+  matsToCleanup: OpenCVMat[]
+): OpenCVMat {
+  // Use a small version for speed
+  const small = new cv.Mat()
+  const scale = Math.min(500 / src.cols, 500 / src.rows)
+  const dsize = new cv.Size(Math.round(src.cols * scale), Math.round(src.rows * scale))
+  cv.resize(src, small, dsize, 0, 0, cv.INTER_AREA) // INTER_AREA is good for shrinking
+
+  const gray = new cv.Mat()
+  cv.cvtColor(small, gray, cv.COLOR_RGBA2GRAY, 0)
+
+  // Use Canny to detect edges (text/graphics)
+  const edges = new cv.Mat()
+  cv.Canny(gray, edges, 50, 150, 3, false)
+
+  const h = edges.rows
+  const w = edges.cols
+
+  // Define regions (Top, Bottom, Left, Right - approx 20%)
+  const topRect = new cv.Rect(0, 0, w, Math.floor(h * 0.2))
+  const bottomRect = new cv.Rect(0, h - Math.floor(h * 0.2), w, Math.floor(h * 0.2))
+  const leftRect = new cv.Rect(0, 0, Math.floor(w * 0.2), h)
+  const rightRect = new cv.Rect(w - Math.floor(w * 0.2), 0, Math.floor(w * 0.2), h)
+
+  const topRoi = edges.roi(topRect)
+  const bottomRoi = edges.roi(bottomRect)
+  const leftRoi = edges.roi(leftRect)
+  const rightRoi = edges.roi(rightRect)
+
+  const topCount = cv.countNonZero(topRoi)
+  const bottomCount = cv.countNonZero(bottomRoi)
+  const leftCount = cv.countNonZero(leftRoi)
+  const rightCount = cv.countNonZero(rightRoi)
+
+  // Clean up ROIs and temps
+  topRoi.delete(); bottomRoi.delete(); leftRoi.delete(); rightRoi.delete()
+  small.delete(); gray.delete(); edges.delete()
+
+  // Determine orientation
+  // We assume the header (text/logos) has the highest edge density.
+
+  // Logic:
+  // If Portrait Aspect (H > W):
+  //   - Max(Top, Bottom) usually.
+  //   - If Top > Bottom -> Upright.
+  //   - If Bottom > Top -> Upside Down (180).
+  // If Landscape Aspect (W > H):
+  //   - Max(Left, Right) usually (since it's rotated 90 deg).
+  //   - If Left > Right -> Top is at Left -> Rotate 90 CW.
+  //   - If Right > Left -> Top is at Right -> Rotate 90 CCW.
+
+  // But we should just look at all 4 to be safe.
+
+  const densities = [
+    { dir: 'top', val: topCount, rot: null },
+    { dir: 'bottom', val: bottomCount, rot: cv.ROTATE_180 },
+    { dir: 'left', val: leftCount, rot: cv.ROTATE_90_CLOCKWISE }, // Top is Left -> Rotate CW to fix
+    { dir: 'right', val: rightCount, rot: cv.ROTATE_90_COUNTERCLOCKWISE } // Top is Right -> Rotate CCW to fix
+  ]
+
+  // Sort by density desc
+  densities.sort((a, b) => b.val - a.val)
+
+  const best = densities[0]
+
+  // Apply rotation if needed
+  if (best.rot !== null) {
+    const rotated = new cv.Mat()
+    cv.rotate(src, rotated, best.rot)
+    src.delete() // Delete old src
+    return rotated
+  }
+
+  return src
 }
 
 /**

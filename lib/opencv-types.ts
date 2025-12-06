@@ -270,6 +270,7 @@ export interface OpenCVInstance {
   ): void
   
   // Statistics
+  countNonZero(src: OpenCVMat): number
   meanStdDev(
     src: OpenCVMat,
     mean: OpenCVMat,
