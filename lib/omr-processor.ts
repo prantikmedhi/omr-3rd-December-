@@ -198,8 +198,19 @@ function processImageOpenCV(
     processingInfo.push(`Detected ${bubbles.length} bubbles`)
 
     // Step 5: Group bubbles into rows
-    const rows = groupBubblesIntoRows(bubbles, config.choicesPerQuestion)
+    let rows = groupBubblesIntoRows(bubbles, config.choicesPerQuestion)
     
+    // Recovery Step: Attempt to find missing bubbles based on grid structure
+    if (rows.length > 0) {
+      const recoveredBubbles = recoverMissingBubbles(cv, src, rows, config, quality, matsToCleanup)
+      if (recoveredBubbles.length > 0) {
+        processingInfo.push(`Recovered ${recoveredBubbles.length} missing bubbles`)
+        // Re-group with recovered bubbles
+        const allBubbles = [...bubbles, ...recoveredBubbles]
+        rows = groupBubblesIntoRows(allBubbles, config.choicesPerQuestion)
+      }
+    }
+
     if (rows.length === 0) {
       throw new Error(
         "Could not organize bubbles into question rows.\n" +
@@ -659,78 +670,58 @@ function autoCorrectOrientation(
   src: OpenCVMat,
   matsToCleanup: OpenCVMat[]
 ): OpenCVMat {
-  // Use a small version for speed
-  const small = new cv.Mat()
-  const scale = Math.min(500 / src.cols, 500 / src.rows)
-  const dsize = new cv.Size(Math.round(src.cols * scale), Math.round(src.rows * scale))
-  cv.resize(src, small, dsize, 0, 0, cv.INTER_AREA) // INTER_AREA is good for shrinking
-
-  const gray = new cv.Mat()
-  cv.cvtColor(small, gray, cv.COLOR_RGBA2GRAY, 0)
-
-  // Use Canny to detect edges (text/graphics)
-  const edges = new cv.Mat()
-  cv.Canny(gray, edges, 50, 150, 3, false)
-
-  const h = edges.rows
-  const w = edges.cols
-
-  // Define regions (Top, Bottom, Left, Right - approx 20%)
-  const topRect = new cv.Rect(0, 0, w, Math.floor(h * 0.2))
-  const bottomRect = new cv.Rect(0, h - Math.floor(h * 0.2), w, Math.floor(h * 0.2))
-  const leftRect = new cv.Rect(0, 0, Math.floor(w * 0.2), h)
-  const rightRect = new cv.Rect(w - Math.floor(w * 0.2), 0, Math.floor(w * 0.2), h)
-
-  const topRoi = edges.roi(topRect)
-  const bottomRoi = edges.roi(bottomRect)
-  const leftRoi = edges.roi(leftRect)
-  const rightRoi = edges.roi(rightRect)
-
-  const topCount = cv.countNonZero(topRoi)
-  const bottomCount = cv.countNonZero(bottomRoi)
-  const leftCount = cv.countNonZero(leftRoi)
-  const rightCount = cv.countNonZero(rightRoi)
-
-  // Clean up ROIs and temps
-  topRoi.delete(); bottomRoi.delete(); leftRoi.delete(); rightRoi.delete()
-  small.delete(); gray.delete(); edges.delete()
-
-  // Determine orientation
-  // We assume the header (text/logos) has the highest edge density.
-
-  // Logic:
-  // If Portrait Aspect (H > W):
-  //   - Max(Top, Bottom) usually.
-  //   - If Top > Bottom -> Upright.
-  //   - If Bottom > Top -> Upside Down (180).
-  // If Landscape Aspect (W > H):
-  //   - Max(Left, Right) usually (since it's rotated 90 deg).
-  //   - If Left > Right -> Top is at Left -> Rotate 90 CW.
-  //   - If Right > Left -> Top is at Right -> Rotate 90 CCW.
-
-  // But we should just look at all 4 to be safe.
-
-  const densities = [
-    { dir: 'top', val: topCount, rot: null },
-    { dir: 'bottom', val: bottomCount, rot: cv.ROTATE_180 },
-    { dir: 'left', val: leftCount, rot: cv.ROTATE_90_CLOCKWISE }, // Top is Left -> Rotate CW to fix
-    { dir: 'right', val: rightCount, rot: cv.ROTATE_90_COUNTERCLOCKWISE } // Top is Right -> Rotate CCW to fix
-  ]
-
-  // Sort by density desc
-  densities.sort((a, b) => b.val - a.val)
-
-  const best = densities[0]
-
-  // Apply rotation if needed
-  if (best.rot !== null) {
-    const rotated = new cv.Mat()
-    cv.rotate(src, rotated, best.rot)
-    src.delete() // Delete old src
-    return rotated
+  // Step 1: Ensure Portrait Orientation first
+  let workingMat = src;
+  if (src.cols > src.rows) {
+    // Landscape -> Rotate 90 CW to make it Portrait
+    const rotated = new cv.Mat();
+    cv.rotate(src, rotated, cv.ROTATE_90_CLOCKWISE);
+    src.delete(); // Delete original landscape src
+    workingMat = rotated;
   }
 
-  return src
+  // Step 2: Check for Upside Down (180 rotation)
+  // Use a small version for speed
+  const small = new cv.Mat();
+  const scale = Math.min(500 / workingMat.cols, 500 / workingMat.rows);
+  const dsize = new cv.Size(Math.round(workingMat.cols * scale), Math.round(workingMat.rows * scale));
+  cv.resize(workingMat, small, dsize, 0, 0, cv.INTER_AREA);
+
+  const gray = new cv.Mat();
+  cv.cvtColor(small, gray, cv.COLOR_RGBA2GRAY, 0);
+
+  // Use Adaptive Thresholding to find text/ink (robust to lighting)
+  const binary = new cv.Mat();
+  cv.adaptiveThreshold(gray, binary, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 25, 10);
+
+  const h = binary.rows;
+  const w = binary.cols;
+
+  // Compare Top 20% vs Bottom 20% pixel density
+  // Headers (text) usually have more ink than the bottom (which might be empty or just footer)
+  const topRect = new cv.Rect(0, 0, w, Math.floor(h * 0.2));
+  const bottomRect = new cv.Rect(0, h - Math.floor(h * 0.2), w, Math.floor(h * 0.2));
+
+  const topRoi = binary.roi(topRect);
+  const bottomRoi = binary.roi(bottomRect);
+
+  const topCount = cv.countNonZero(topRoi);
+  const bottomCount = cv.countNonZero(bottomRoi);
+
+  // Clean up ROIs and temps
+  topRoi.delete(); bottomRoi.delete();
+  small.delete(); gray.delete(); binary.delete();
+
+  // If Bottom is significantly denser than Top, it's likely upside down
+  // We use a ratio to avoid flipping on balanced sheets
+  if (bottomCount > topCount * 1.2) {
+     const rotated = new cv.Mat();
+     cv.rotate(workingMat, rotated, cv.ROTATE_180);
+     workingMat.delete(); // Delete the portrait workingMat
+     return rotated;
+  }
+
+  return workingMat;
 }
 
 /**
@@ -922,6 +913,162 @@ function detectBubblesAdvanced(
   }
 
   return bubbles
+}
+
+/**
+ * Attempt to recover missing bubbles by analyzing the grid structure
+ */
+function recoverMissingBubbles(
+  cv: OpenCVInstance,
+  src: OpenCVMat,
+  rows: BubbleRow[],
+  config: ProcessingConfig,
+  quality: ImageQualityMetrics,
+  matsToCleanup: OpenCVMat[]
+): Bubble[] {
+  const recovered: Bubble[] = []
+
+  // 1. Calculate grid statistics (avg width, height, spacing)
+  let totalWidth = 0, totalHeight = 0, count = 0
+  let totalXSpacing = 0, spacingCount = 0
+
+  rows.forEach(row => {
+    row.bubbles.forEach((b, i) => {
+      totalWidth += b.width
+      totalHeight += b.height
+      count++
+
+      if (i < row.bubbles.length - 1) {
+        totalXSpacing += (row.bubbles[i+1].centerX - b.centerX)
+        spacingCount++
+      }
+    })
+  })
+
+  if (count === 0 || spacingCount === 0) return []
+
+  const avgW = totalWidth / count
+  const avgH = totalHeight / count
+  const avgXGap = totalXSpacing / spacingCount
+
+  // 2. Iterate rows and check for gaps
+  for (const row of rows) {
+    if (row.bubbles.length < config.choicesPerQuestion) {
+      // Sort bubbles by X
+      row.bubbles.sort((a, b) => a.centerX - b.centerX)
+
+      // Check gaps between existing bubbles
+      for (let i = 0; i < row.bubbles.length - 1; i++) {
+        const curr = row.bubbles[i]
+        const next = row.bubbles[i+1]
+        const gap = next.centerX - curr.centerX
+
+        // If gap is approx double the average spacing (within 40% margin), we likely missed one in between
+        if (Math.abs(gap - (avgXGap * 2)) < avgXGap * 0.4) {
+           const missingX = (curr.centerX + next.centerX) / 2
+           const missingY = (curr.centerY + next.centerY) / 2
+
+           // Verify if there is actually something there (using less strict check)
+           const recoveredBubble = verifyBubbleAtLocation(cv, src, missingX, missingY, avgW, avgH, matsToCleanup)
+           if (recoveredBubble) recovered.push(recoveredBubble)
+        }
+      }
+
+      // Check before first bubble (if row is shifted right)
+      // Check after last bubble (if row is truncated)
+      // This is trickier without absolute column anchors.
+      // Simplified: If we have at least 2 bubbles, we can project forward/backward.
+
+      if (row.bubbles.length >= 2) {
+        // Track locally recovered bubbles for this row to ensure we don't exceed choicesPerQuestion
+        let rowRecoveredCount = 0;
+
+        // Look ahead
+        const last = row.bubbles[row.bubbles.length - 1]
+        const expectedNextX = last.centerX + avgXGap
+
+        if (row.bubbles.length + rowRecoveredCount < config.choicesPerQuestion) {
+           // We're missing some at the end
+           const recoveredBubble = verifyBubbleAtLocation(cv, src, expectedNextX, last.centerY, avgW, avgH, matsToCleanup)
+           if (recoveredBubble) {
+             recovered.push(recoveredBubble)
+             rowRecoveredCount++
+           }
+        }
+
+        // Look behind
+        const first = row.bubbles[0]
+        const expectedPrevX = first.centerX - avgXGap
+        if (expectedPrevX > 0 && (row.bubbles.length + rowRecoveredCount) < config.choicesPerQuestion) { // Simple bounds check
+            const recoveredBubble = verifyBubbleAtLocation(cv, src, expectedPrevX, first.centerY, avgW, avgH, matsToCleanup)
+            if (recoveredBubble) {
+              recovered.push(recoveredBubble)
+              rowRecoveredCount++
+            }
+        }
+      }
+    }
+  }
+
+  return recovered
+}
+
+function verifyBubbleAtLocation(
+  cv: OpenCVInstance,
+  src: OpenCVMat,
+  centerX: number,
+  centerY: number,
+  width: number,
+  height: number,
+  matsToCleanup: OpenCVMat[]
+): Bubble | null {
+  // Define a ROI around the expected location
+  const padding = 2
+  const x = Math.floor(centerX - width/2 - padding)
+  const y = Math.floor(centerY - height/2 - padding)
+  const w = Math.floor(width + padding*2)
+  const h = Math.floor(height + padding*2)
+
+  if (x < 0 || y < 0 || x+w >= src.cols || y+h >= src.rows) return null
+
+  const rect = new cv.Rect(x, y, w, h)
+
+  // We check if there's *any* circular-ish contour in this region
+  // or simply return a synthetic bubble if the pixel intensity suggests it's valid markable area
+  // For now, let's just return a synthetic bubble to "force" the question to exist,
+  // so the user can see it (even if empty).
+  // Ideally, we'd run a local HoughCircles or weak contour check.
+
+  // Let's do a quick local check
+  const roi = src.roi(rect)
+  const gray = new cv.Mat()
+  cv.cvtColor(roi, gray, cv.COLOR_RGBA2GRAY, 0)
+
+  // Simple binary threshold
+  const thresh = new cv.Mat()
+  cv.threshold(gray, thresh, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU)
+
+  // Check if we have some ink (contour borders usually)
+  const nonZero = cv.countNonZero(thresh)
+  const fillRatio = nonZero / (w * h)
+
+  roi.delete(); gray.delete(); thresh.delete()
+
+  // If it's not completely empty or completely full noise
+  if (fillRatio > 0.05 && fillRatio < 0.9) {
+     return {
+        x: x + padding,
+        y: y + padding,
+        width: width,
+        height: height,
+        centerX: centerX,
+        centerY: centerY,
+        area: width * height, // Estimate
+        circularity: 1.0 // Assume perfect
+     }
+  }
+
+  return null
 }
 
 /**
